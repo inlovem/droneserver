@@ -1,0 +1,104 @@
+import os
+from flask import Flask, request, jsonify
+from dronekit import connect, VehicleMode, LocationGlobalRelative, Command
+from pymavlink import mavutil
+import time
+import threading
+import json
+
+app = Flask(__name__)
+
+def drone_function(data):
+    def condition_yaw(vehicle, heading, relative=False):
+        if relative:
+            is_relative = 1
+        else:
+            is_relative = 0
+
+        msg = vehicle.message_factory.command_long_encode(
+            0, 0,
+            mavutil.mavlink.MAV_CMD_CONDITION_YAW,
+            0,
+            heading,
+            0, 0, 0, 0, 0, 0,
+            is_relative)
+        vehicle.send_mavlink(msg)
+
+    connection_string = "udpin:0.0.0.0:14550"
+    vehicle = connect(connection_string, wait_ready=True)
+
+    def arm_and_takeoff(altitude):
+        while not vehicle.is_armable:
+            print("Waiting for vehicle to become armable")
+            time.sleep(1)
+
+        vehicle.mode = VehicleMode("GUIDED")
+        while vehicle.mode != "GUIDED":
+            print("Waiting for vehicle to enter GUIDED mode")
+            time.sleep(1)
+
+        vehicle.armed = True
+        while not vehicle.armed:
+            print("Waiting for arming...")
+            time.sleep(1)
+
+        print(f"Taking off to {altitude} meters")
+        vehicle.simple_takeoff(altitude)
+
+        while True:
+            current_altitude = vehicle.location.global_relative_frame.alt
+            print(f"Altitude: {current_altitude} m")
+            if current_altitude >= 0.95 * altitude:
+                break
+            time.sleep(1)
+
+    waypoints = [(point["latitude"], point["longitude"], point["altitude"]) for point in data["flightPlan"]]
+
+    waypoints.append(waypoints[0])
+
+    speed_m_s = 5  # Set speed in meters per second
+    vehicle.parameters['WPNAV_SPEED'] = speed_m_s * 100
+
+    arm_and_takeoff(10)
+
+    for waypoint in waypoints:
+        target_location = LocationGlobalRelative(*waypoint)
+        print(f"Going to waypoint: {waypoint}")
+        vehicle.simple_goto(target_location)
+        time.sleep(20)
+
+        print("Rotating 360 degrees")
+        condition_yaw(vehicle, 360, relative=True)
+        time.sleep(10)
+
+    print("Landing...")
+    vehicle.mode = VehicleMode("LAND")
+    while vehicle.mode != "LAND":
+        print("Waiting for vehicle to enter LAND mode")
+        time.sleep(1)
+
+    while vehicle.armed:
+        print("Waiting for disarming...")
+        time.sleep(1)
+
+    vehicle.close()
+
+@app.route('/start-flight', methods=['POST'])
+def start_flight():
+    data = request.get_json()
+    print("Received data: ", data)
+
+  
+    desktop_path = os.path.expanduser("~/Desktop")
+    drone_control_folder = os.path.join(desktop_path, "drone_control")
+    os.makedirs(drone_control_folder, exist_ok=True)
+
+    # Save the data to a file in the specified folder
+    with open(os.path.join(drone_control_folder, 'flight_data3.json'), 'w') as f:
+        json.dump(data, f, indent=4)
+    threading.Thread(target=drone_function, args=(data,)).start()
+
+    return jsonify({'message': 'Started flight'}), 200
+
+if __name__ == "__main__":
+    app.run(host='0.0.0.0', port=2000)
